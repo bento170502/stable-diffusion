@@ -2,6 +2,7 @@ import argparse, os, sys, glob
 import cv2
 import torch
 import numpy as np
+import statistics
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
@@ -13,7 +14,6 @@ import time
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import contextmanager, nullcontext
-
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
@@ -60,6 +60,10 @@ def load_model_from_config(config, ckpt, verbose=False):
     if len(u) > 0 and verbose:
         print("unexpected keys:")
         print(u)
+    
+    if torch.cuda.is_available():
+        #Clear cache before moving to GPU
+        torch.cuda.empty_cache()
 
     model.cuda()
     model.eval()
@@ -99,12 +103,20 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--prompt",
+        "--prompts",
         type=str,
-        nargs="?",
+        nargs="+",
         default="a painting of a virus monster playing guitar",
-        help="the prompt to render"
+        help="list of prompts to process sequentially"
     )
+    
+    parser.add_argument(
+        "--timing_output",
+        type=str,
+        default="generation_times.txt",
+        help="file to save timing results"
+    )
+    
     parser.add_argument(
         "--outdir",
         type=str,
@@ -163,13 +175,13 @@ def main():
     parser.add_argument(
         "--H",
         type=int,
-        default=512,
+        default=384,
         help="image height, in pixel space",
     )
     parser.add_argument(
         "--W",
         type=int,
-        default=512,
+        default=384,
         help="image width, in pixel space",
     )
     parser.add_argument(
@@ -187,7 +199,7 @@ def main():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a. batch size",
     )
     parser.add_argument(
@@ -266,7 +278,7 @@ def main():
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
     if not opt.from_file:
-        prompt = opt.prompt
+        prompt = opt.prompts
         assert prompt is not None
         data = [batch_size * [prompt]]
 
@@ -286,67 +298,88 @@ def main():
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
-    with torch.no_grad():
-        with precision_scope("cuda"):
+    
+    generation_times = []
+    with precision_scope("cuda"):
             with model.ema_scope():
-                tic = time.time()
-                all_samples = list()
-                for n in trange(opt.n_iter, desc="Sampling"):
-                    for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
-                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                         conditioning=c,
-                                                         batch_size=opt.n_samples,
-                                                         shape=shape,
-                                                         verbose=False,
-                                                         unconditional_guidance_scale=opt.scale,
-                                                         unconditional_conditioning=uc,
-                                                         eta=opt.ddim_eta,
-                                                         x_T=start_code)
+                for prompt in opt.prompts:
+                    print(f"\nProcessing prompt: {prompt}")
+                    
+                    # Reset batch size to 1 for sequential processing
+                    batch_size = 1
+                    data = [batch_size * [prompt]]
+                    
+                    # Timer start
+                    prompt_start_time = time.time()
+                    
+                    all_samples = list()
+                    for n in trange(opt.n_iter, desc="Sampling"):
+                        for prompts in tqdm(data, desc="data"):
+                            uc = None
+                            if opt.scale != 1.0:
+                                uc = model.get_learned_conditioning(batch_size * [""])
+                            if isinstance(prompts, tuple):
+                                prompts = list(prompts)
+                            c = model.get_learned_conditioning(prompts)
+                            shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                            
+                            samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                           conditioning=c,
+                                                           batch_size=batch_size,
+                                                           shape=shape,
+                                                           verbose=False,
+                                                           unconditional_guidance_scale=opt.scale,
+                                                           unconditional_conditioning=uc,
+                                                           eta=opt.ddim_eta,
+                                                           x_T=start_code)
 
-                        x_samples_ddim = model.decode_first_stage(samples_ddim)
-                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+                            x_samples_ddim = model.decode_first_stage(samples_ddim)
+                            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                            x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                            x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                            x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
-                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+                            if not opt.skip_save:
+                                for x_sample in x_checked_image_torch:
+                                    x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                                    img = Image.fromarray(x_sample.astype(np.uint8))
+                                    img = put_watermark(img, wm_encoder)
+                                    img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                                    base_count += 1
 
-                        if not opt.skip_save:
-                            for x_sample in x_checked_image_torch:
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                img = put_watermark(img, wm_encoder)
-                                img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                                base_count += 1
+                            if not opt.skip_grid:
+                                all_samples.append(x_checked_image_torch)
+                    
+                    # Timer end and record
+                    prompt_time = time.time() - prompt_start_time
+                    generation_times.append(prompt_time)
+                    print(f"Time taken for prompt: {prompt_time:.2f} seconds")
+                    
+                    # Clear CUDA cache between generations
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+    
+    # Calculate and save timing statistics
+    mean_time = statistics.mean(generation_times)
+    std_dev = statistics.stdev(generation_times) if len(generation_times) > 1 else 0
+    
+    timing_stats = (
+        f"Generation Statistics:\n"
+        f"Total prompts processed: {len(generation_times)}\n"
+        f"Mean generation time: {mean_time:.2f} seconds\n"
+        f"Standard deviation: {std_dev:.2f} seconds\n"
+        f"Individual times: {[f'{t:.2f}' for t in generation_times]}\n"
+    )
+    
+    print("\n" + timing_stats)
+    
+    # Save timing statistics to file
+    with open(opt.timing_output, "w") as f:
+        f.write(timing_stats)
 
-                        if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
-
-                if not opt.skip_grid:
-                    # additionally, save as grid
-                    grid = torch.stack(all_samples, 0)
-                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                    grid = make_grid(grid, nrow=n_rows)
-
-                    # to image
-                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    img = Image.fromarray(grid.astype(np.uint8))
-                    img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                    grid_count += 1
-
-                toc = time.time()
-
-    print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
-          f" \nEnjoy.")
-
+    print(f"Your samples are ready and waiting for you here: \n{outpath}")
+    print(f"Timing statistics have been saved to: {opt.timing_output}")
 
 if __name__ == "__main__":
     main()
